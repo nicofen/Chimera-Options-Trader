@@ -38,7 +38,7 @@ This software is provided for educational and research purposes. The authors acc
 
 ---
 
-## 1. What Is Chimera v12?
+## 1. What Is Chimera Options Trader?
 
 Chimera v12 is the result of merging two powerful but separate trading systems:
 
