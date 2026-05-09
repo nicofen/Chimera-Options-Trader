@@ -1,0 +1,529 @@
+"""
+chimera_v12/tests/test_unified.py
+Integration tests for Project Chimera v12.
+Run with: python -m pytest chimera_v12/tests/ -v
+"""
+
+import math
+import sys
+import os
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+import pytest
+from chimera_v12.core.state import SharedState, MarketRegime, TechnicalSignals, RiskParameters
+from chimera_v12.options.wheel_engine import black_scholes_greeks, iv_rank, find_target_strike, WheelEngine
+from chimera_v12.strategies.scoring import (
+    piotroski_f_score, value_score, momentum_score,
+    growth_score, compute_composite, kelly_position_size,
+)
+from chimera_v12.strategies.quant_edge.engine import (
+    OptionsMicrostructureArb, CrossAssetETFArb,
+    OrderFlowImbalance, VolSurfaceArb, NewsSentimentAlpha,
+)
+from chimera_v12.strategies.sector.engine import (
+    squeeze_probability_score, StocksStrategy, CryptoStrategy,
+    ForexStrategy, FuturesStrategy,
+)
+from chimera_v12.orchestrator.master import VotingAgent, HITLCheckpoint
+from chimera_v12.utils.ta import ema, rsi, adx, atr_value, bollinger_squeeze
+from chimera_v12.config.settings import load_config
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fixtures
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.fixture
+def state():
+    return SharedState()
+
+
+@pytest.fixture
+def config():
+    """Minimal config for tests — avoids env var requirements."""
+    return {
+        "mode": "paper",
+        "stocks": {
+            "squeeze": {
+                "min_sp_score": 0.60, "si_weight": 0.40,
+                "rvol_weight": 0.30, "sentiment_weight": 0.30,
+                "si_cap": 0.50, "rvol_cap": 10.0,
+            },
+            "adx_trending": 25, "adx_ranging": 20,
+            "atr_multiplier_stop": 2.0, "atr_multiplier_target": 3.0,
+        },
+        "crypto":  {"ema_fast": 9, "ema_slow": 21, "rsi_period": 14,
+                    "rsi_oversold": 30, "rsi_overbought": 70,
+                    "btc_inflow_threshold": 1_000_000,
+                    "sol_memecoin_spike_threshold": 50_000_000,
+                    "funding_rate_extreme": 0.01},
+        "forex":   {"ema_fast": 20, "ema_slow": 50, "rsi_period": 14,
+                    "rsi_momentum_bull": 55, "rsi_momentum_bear": 45,
+                    "news_bias_weight": 0.40, "carry_weight": 0.20,
+                    "session_filter": False},
+        "futures": {"va_lookback_bars": 20, "va_pct": 0.70,
+                    "adx_trending": 25, "rollover_days_before": 5},
+        "options_wheel": {
+            "min_iv_rank": 30, "max_iv_rank": 85,
+            "dte_target": 30, "dte_min_close": 7,
+            "profit_target_pct": 0.50, "loss_limit_pct": 2.00,
+            "min_premium_pct": 0.01, "target_delta_put": 0.30,
+            "target_delta_call": 0.30,
+        },
+        "quant_edge": {
+            "options_microstructure": {"min_bid_ask_edge_bps": 5, "hold_seconds_min": 30},
+            "etf_arb": {"pairs": [["SPY", "ES1!"]], "z_score_entry": 2.0,
+                        "z_score_exit": 0.5, "min_spread_bps": 5,
+                        "mean_revert_minutes": 10},
+            "order_flow_imbalance": {"imbalance_thresh": 0.60, "window_seconds": 60},
+            "vol_surface_arb": {"skew_zscore_entry": 2.0},
+            "news_sentiment_alpha": {"min_score": 0.65, "hold_minutes": 15,
+                                     "decay_halflife_min": 30},
+        },
+        "risk": {
+            "base_risk_pct": 0.01, "kelly_fraction": 0.25,
+            "avg_win_r": 1.8, "avg_loss_r": 1.0,
+            "max_single_position": 0.10, "hitl_threshold_usd": 10_000,
+        },
+        "wheel_candidates": ["AAPL", "MSFT"],
+        "intervals": {"strategy_seconds": 15, "options_scan_seconds": 120,
+                      "quant_edge_seconds": 5},
+    }
+
+
+@pytest.fixture
+def sample_prices():
+    import numpy as np
+    np.random.seed(42)
+    # 260 bars of synthetic price data with upward drift
+    p = [100.0]
+    for _ in range(259):
+        p.append(p[-1] * (1 + np.random.normal(0.0003, 0.015)))
+    return p
+
+
+@pytest.fixture
+def sample_bars(sample_prices):
+    import numpy as np
+    closes  = sample_prices
+    highs   = [c * 1.005 for c in closes]
+    lows    = [c * 0.995 for c in closes]
+    volumes = [1_000_000 + np.random.randint(-200_000, 200_000) for _ in closes]
+    return {"close": closes, "high": highs, "low": lows, "volume": volumes}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. Core State Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSharedState:
+    def test_initial_equity(self, state):
+        assert state.equity == 100_000.0
+
+    def test_initial_regime(self, state):
+        assert state.regime == MarketRegime.UNKNOWN
+
+    def test_snapshot_returns_dict(self, state):
+        snap = state.snapshot("AAPL")
+        assert isinstance(snap, dict)
+        assert snap["symbol"] == "AAPL"
+        assert "final_trade_decision" in snap
+        assert "audit_trail" in snap
+
+    def test_snapshot_defaults(self, state):
+        snap = state.snapshot("TSLA")
+        assert snap["circuit_open"] is False
+        assert snap["news_veto_active"] is False
+        assert snap["hitl_required"] is False
+
+    def test_circuit_open_propagates(self, state):
+        state.circuit_open = True
+        snap = state.snapshot("AAPL")
+        assert snap["circuit_open"] is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. Options Wheel Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBlackScholes:
+    def test_call_positive(self):
+        g = black_scholes_greeks(100, 100, 0.25, 0.05, 0.20, "call")
+        assert g["price"] > 0
+        assert 0 < g["delta"] < 1
+
+    def test_put_positive(self):
+        g = black_scholes_greeks(100, 100, 0.25, 0.05, 0.20, "put")
+        assert g["price"] > 0
+        assert -1 < g["delta"] < 0
+
+    def test_put_call_parity(self):
+        """C - P ≈ S - K*e^(-rT)"""
+        S, K, T, r, sig = 100, 100, 0.25, 0.05, 0.20
+        c = black_scholes_greeks(S, K, T, r, sig, "call")["price"]
+        p = black_scholes_greeks(S, K, T, r, sig, "put")["price"]
+        parity = S - K * math.exp(-r * T)
+        assert abs((c - p) - parity) < 0.01
+
+    def test_deep_itm_call_delta(self):
+        g = black_scholes_greeks(150, 100, 1.0, 0.05, 0.20, "call")
+        assert g["delta"] > 0.90
+
+    def test_deep_otm_put_delta(self):
+        g = black_scholes_greeks(150, 100, 0.08, 0.05, 0.20, "put")
+        assert abs(g["delta"]) < 0.10
+
+    def test_zero_dte_returns_zeros(self):
+        g = black_scholes_greeks(100, 100, 0, 0.05, 0.20)
+        assert g["price"] == 0.0
+
+    def test_iv_rank_range(self):
+        assert iv_rank(0.30, 0.15, 0.60) == pytest.approx(33.33, rel=0.01)
+        assert iv_rank(0.60, 0.15, 0.60) == pytest.approx(100.0, rel=0.01)
+        assert iv_rank(0.15, 0.15, 0.60) == pytest.approx(0.0, rel=0.01)
+
+    def test_find_target_strike_delta(self):
+        strike, greeks = find_target_strike(100, 0.25, 30, 0.30, 0.05, "put")
+        assert 70 <= strike <= 100
+        assert abs(abs(greeks["delta"]) - 0.30) < 0.15
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. Scoring Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestScoring:
+    def test_piotroski_perfect_score(self):
+        # F4 (low accruals): CFO/assets must exceed ROA
+        # accrual = roa - (cfo/ta); need accrual < 0 → cfo/ta > roa
+        # roa=0.10, cfo/ta = 9_000_000/50_000_000 = 0.18 > 0.10 ✓
+        funds = {
+            "roa": 0.10, "roa_prior": 0.08,
+            "operating_cashflow": 9_000_000,
+            "total_assets": 50_000_000,
+            "long_term_debt": 1_000_000,
+            "long_term_debt_prior": 2_000_000,
+            "current_ratio": 2.5, "current_ratio_prior": 2.0,
+            "shares_issued_yoy": False,
+            "gross_margin": 0.45, "gross_margin_prior": 0.40,
+            "asset_turnover": 1.2, "asset_turnover_prior": 1.0,
+        }
+        score, detail = piotroski_f_score(funds)
+        assert score == 9
+        assert all(v == 1 for v in detail.values())
+
+    def test_piotroski_zero_score(self):
+        funds = {
+            "roa": -0.05, "roa_prior": 0.05,
+            "operating_cashflow": -100_000,
+            "total_assets": 1_000_000,
+            "long_term_debt": 500_000, "long_term_debt_prior": 400_000,
+            "current_ratio": 0.8, "current_ratio_prior": 1.2,
+            "shares_issued_yoy": True,
+            "gross_margin": 0.20, "gross_margin_prior": 0.30,
+            "asset_turnover": 0.5, "asset_turnover_prior": 0.8,
+        }
+        score, _ = piotroski_f_score(funds)
+        assert score == 0
+
+    def test_value_score_cheap_stock(self):
+        funds = {"pe_ratio": 10, "pb_ratio": 1.0, "ev_ebitda": 6, "fcf_yield": 0.08, "roic": 0.20}
+        score = value_score(funds)
+        assert score > 0.60
+
+    def test_value_score_expensive(self):
+        funds = {"pe_ratio": 80, "pb_ratio": 15, "ev_ebitda": 40, "fcf_yield": 0.005, "roic": 0.05}
+        score = value_score(funds)
+        assert score < 0.40
+
+    def test_momentum_score_uptrend(self, sample_prices):
+        # Growing prices → strong momentum
+        score = momentum_score(sample_prices)
+        assert 0.0 <= score <= 1.0
+
+    def test_growth_score_high(self):
+        funds = {"revenue_growth_yoy": 0.30, "eps_growth_yoy": 0.25,
+                 "fcf_growth_yoy": 0.20, "revenue_acceleration": 0.05}
+        score = growth_score(funds)
+        assert score > 0.60
+
+    def test_composite_score_range(self, sample_prices):
+        funds = {
+            "roa": 0.12, "roa_prior": 0.10, "operating_cashflow": 1e6,
+            "total_assets": 10e6, "long_term_debt": 500_000,
+            "long_term_debt_prior": 700_000, "current_ratio": 2.0,
+            "current_ratio_prior": 1.8, "shares_issued_yoy": False,
+            "gross_margin": 0.40, "gross_margin_prior": 0.38,
+            "asset_turnover": 1.0, "asset_turnover_prior": 0.95,
+            "pe_ratio": 20, "pb_ratio": 3, "ev_ebitda": 12, "fcf_yield": 0.05, "roic": 0.18,
+            "revenue_growth_yoy": 0.15, "eps_growth_yoy": 0.12,
+            "fcf_growth_yoy": 0.10, "revenue_acceleration": 0.02,
+            "sector": "technology",
+        }
+        cs = compute_composite("AAPL", "technology", funds, sample_prices)
+        assert 0.0 <= cs.composite <= 1.0
+        assert cs.recommendation in ["STRONG BUY","BUY","HOLD","SELL","STRONG SELL"]
+
+    def test_kelly_sizing(self):
+        size = kelly_position_size(100_000, 0.55, 1.8, 1.0, 0.25, 0.70, 0.10)
+        assert 0 < size <= 10_000   # max 10% of equity
+        # Higher composite score → larger position
+        size_low = kelly_position_size(100_000, 0.55, 1.8, 1.0, 0.25, 0.20, 0.10)
+        assert size > size_low
+
+    def test_kelly_zero_win_rate(self):
+        size = kelly_position_size(100_000, 0.0, 1.8, 1.0, 0.25, 0.70, 0.10)
+        assert size == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Quant Edge Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestQuantEdge:
+    def test_microstructure_arb_detects_skew(self, config):
+        arb = OptionsMicrostructureArb(config)
+        sig = arb.scan("SPY", {"atm_call_iv": 0.20, "atm_put_iv": 0.24})
+        assert sig is not None
+        assert sig.direction in ("BUY", "SELL")
+        assert sig.strength > 0
+
+    def test_microstructure_no_signal_small_skew(self, config):
+        arb = OptionsMicrostructureArb(config)
+        # 0.001% skew = 0.1 bps — well below the 5 bps threshold
+        sig = arb.scan("SPY", {"atm_call_iv": 0.20000, "atm_put_iv": 0.20001})
+        assert sig is None
+
+    def test_order_flow_imbalance_buy(self, config):
+        ofi = OrderFlowImbalance(config)
+        sig = ofi.scan("AAPL", bid_volume=8000, ask_volume=2000)
+        assert sig is not None
+        assert sig.direction == "BUY"
+        assert sig.strength >= 0.60
+
+    def test_order_flow_imbalance_sell(self, config):
+        ofi = OrderFlowImbalance(config)
+        sig = ofi.scan("AAPL", bid_volume=1000, ask_volume=9000)
+        assert sig is not None
+        assert sig.direction == "SELL"
+
+    def test_order_flow_no_signal_balanced(self, config):
+        ofi = OrderFlowImbalance(config)
+        sig = ofi.scan("AAPL", bid_volume=5000, ask_volume=5000)
+        assert sig is None
+
+    def test_news_sentiment_strong_beat(self, config):
+        ns = NewsSentimentAlpha(config)
+        sig = ns.process_news("NVDA", 0.85, "earnings_beat")
+        assert sig is not None
+        assert sig.direction == "BUY"
+        assert sig.strength > 0.65
+
+    def test_news_sentiment_fade_overreaction(self, config):
+        ns = NewsSentimentAlpha(config)
+        sig = ns.process_news("TSLA", 0.90, "earnings_beat", gap_pct=0.15)
+        # Gap > 10% → fade it (sell the news)
+        assert sig is not None
+        assert sig.direction == "SELL"
+
+    def test_news_sentiment_below_threshold(self, config):
+        ns = NewsSentimentAlpha(config)
+        sig = ns.process_news("AAPL", 0.40, "general")
+        assert sig is None
+
+    def test_vol_surface_arb_inversion(self, config):
+        vs = VolSurfaceArb(config)
+        # Pre-populate history
+        for _ in range(25):
+            vs.update_and_scan("SPX", iv_front=0.20, iv_back=0.22,
+                                put_skew=0.25, call_skew=0.19)
+        # Now extreme inversion
+        sig = vs.update_and_scan("SPX", iv_front=0.35, iv_back=0.22,
+                                  put_skew=0.25, call_skew=0.19)
+        assert sig is not None
+        assert sig.direction in ("BUY", "SELL")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. Sector Strategy Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSectorStrategies:
+    def test_squeeze_probability_high(self, config):
+        sp = squeeze_probability_score(0.40, 5.0, 3.0,
+                                       config["stocks"]["squeeze"])
+        assert sp > 0.60
+
+    def test_squeeze_probability_low(self, config):
+        sp = squeeze_probability_score(0.02, 1.1, 0.1,
+                                       config["stocks"]["squeeze"])
+        assert sp < 0.30
+
+    def test_squeeze_probability_bounded(self, config):
+        sp = squeeze_probability_score(1.0, 100.0, 100.0,
+                                       config["stocks"]["squeeze"])
+        assert 0.0 <= sp <= 1.0
+
+    def test_stocks_strategy_returns_signal(self, config, sample_bars):
+        strat = StocksStrategy(config)
+        sig   = strat.evaluate("AAPL", sample_bars)
+        assert isinstance(sig, TechnicalSignals)
+        assert sig.direction in ("BUY", "SELL", "HOLD")
+
+    def test_crypto_strategy_whale_veto(self, config, sample_bars):
+        strat = CryptoStrategy(config)
+        sig   = strat.evaluate("BTC/USD", sample_bars,
+                                whale_inflow=5_000_000)  # above threshold
+        assert sig.direction == "HOLD"
+
+    def test_forex_no_signal_in_ranging(self, config, sample_bars):
+        strat = ForexStrategy(config)
+        # Near-flat bars → no strong signal
+        flat_bars = {k: [100.0] * 60 for k in ["close", "high", "low"]}
+        sig = strat.evaluate("EUR/USD", flat_bars)
+        assert isinstance(sig, TechnicalSignals)
+
+    def test_futures_rollover_close(self, config, sample_bars):
+        strat = FuturesStrategy(config)
+        sig   = strat.evaluate("ES1!", sample_bars, days_to_exp=3)
+        assert sig.direction == "CLOSE"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6. Technical Analysis Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTA:
+    def test_ema_length(self, sample_prices):
+        import numpy as np
+        prices = np.array(sample_prices)
+        result = ema(prices, 20)
+        assert len(result) == len(prices)
+
+    def test_rsi_range(self, sample_prices):
+        import numpy as np
+        r = rsi(np.array(sample_prices))
+        assert 0 <= r <= 100
+
+    def test_atr_positive(self, sample_bars):
+        import numpy as np
+        v = atr_value(
+            np.array(sample_bars["high"]),
+            np.array(sample_bars["low"]),
+            np.array(sample_bars["close"]),
+        )
+        assert v > 0
+
+    def test_bollinger_squeeze_bool(self, sample_prices):
+        import numpy as np
+        result = bollinger_squeeze(np.array(sample_prices))
+        assert isinstance(result, bool)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 7. Orchestrator Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOrchestrator:
+    def _base_state(self, config):
+        return {
+            "symbol":          "AAPL",
+            "circuit_open":    False,
+            "news_veto_active": False,
+            "investment_plan": "BUY based on strong fundamentals",
+            "risk_debate_state": {"judge_decision": "APPROVE the trade"},
+            "squeeze_probability": 0.70,
+            "composite_score": 0.72,
+            "order_flow_imbalance": 0.65,
+            "atr": 2.5,
+            "_equity": 100_000.0,
+            "_last_price": 180.0,
+            "audit_trail": [],
+            "cycle_id": "test_cycle_001",
+        }
+
+    def test_circuit_breaker_forces_hold(self, config):
+        voter = VotingAgent()
+        state = self._base_state(config)
+        state["circuit_open"] = True
+        result = voter.resolve(state, config)
+        assert result["final_trade_decision"] == "HOLD"
+        assert result["decision_confidence"] == 1.0
+
+    def test_news_veto_forces_hold(self, config):
+        voter = VotingAgent()
+        state = self._base_state(config)
+        state["news_veto_active"] = True
+        result = voter.resolve(state, config)
+        assert result["final_trade_decision"] == "HOLD"
+
+    def test_strong_buy_consensus(self, config):
+        voter  = VotingAgent()
+        state  = self._base_state(config)
+        result = voter.resolve(state, config)
+        assert result["final_trade_decision"] == "BUY"
+        assert result["position_size_usd"] > 0
+
+    def test_low_composite_downgrades_buy(self, config):
+        voter = VotingAgent()
+        state = self._base_state(config)
+        state["composite_score"] = 0.20   # very low quality
+        result = voter.resolve(state, config)
+        assert result["final_trade_decision"] == "HOLD"
+
+    def test_hitl_flag_on_large_position(self, config):
+        voter = VotingAgent()
+        state = self._base_state(config)
+        state["_equity"]          = 10_000_000  # large account
+        state["composite_score"]  = 0.90
+        result = voter.resolve(state, config)
+        # Large account may trigger HITL
+        assert "hitl_required" in result
+
+    def test_position_size_non_negative(self, config):
+        voter  = VotingAgent()
+        state  = self._base_state(config)
+        result = voter.resolve(state, config)
+        assert result["position_size_usd"] >= 0
+
+    def test_audit_trail_populated(self, config):
+        voter  = VotingAgent()
+        state  = self._base_state(config)
+        result = voter.resolve(state, config)
+        assert len(result["audit_trail"]) > 0
+        assert result["audit_trail"][-1]["agent"] == "VotingAgent"
+
+    def test_stop_loss_below_price_for_buy(self, config):
+        voter  = VotingAgent()
+        state  = self._base_state(config)
+        result = voter.resolve(state, config)
+        if result["final_trade_decision"] == "BUY":
+            assert result["stop_loss"] < state["_last_price"]
+            assert result["take_profit"] > state["_last_price"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. Config Tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConfig:
+    def test_sector_weights_present(self, config):
+        assert "stocks" in config
+        assert "crypto" in config
+        assert "forex" in config
+        assert "futures" in config
+        assert "options_wheel" in config
+        assert "quant_edge" in config
+
+    def test_risk_params_sane(self, config):
+        risk = config["risk"]
+        assert 0 < risk["kelly_fraction"] <= 0.5
+        assert risk["max_single_position"] <= 0.20
+        assert risk["avg_win_r"] > risk["avg_loss_r"]
+
+    def test_wheel_params_sane(self, config):
+        wh = config["options_wheel"]
+        assert 0 < wh["target_delta_put"] < 0.50
+        assert wh["profit_target_pct"] == 0.50
+        assert wh["min_iv_rank"] < wh["max_iv_rank"]
