@@ -1,4 +1,4 @@
-# Project Chimera v12
+# Project Chimera Options Trader
 
 > **The unified, institutional-grade multi-asset algorithmic trading system.**
 > Merges Project Chimera's real-time asyncio infrastructure with TradingAgents' LangGraph multi-agent debate framework — augmented with five professional quant edge strategies and a complete Options Wheel income engine.
